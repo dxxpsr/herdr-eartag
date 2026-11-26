@@ -1,0 +1,39 @@
+# herdr-eartag — plugin that renames tabs automatically
+# Priority: user-set name > Claude session name > other agent > ssh/mosh session > running program > folder name
+# Commands run with the plugin root as cwd, so main.py is called by a relative path.
+# -E -s: block the user's PYTHON* environment variables and site-packages (standard library only)
+
+id = "herdr-eartag"
+name = "herdr-eartag"
+version = "0.3.0"
+description = "Names tabs after the Claude session, running program, ssh server, or folder"
+min_herdr_version = "0.9.5"
+platforms = ["macos", "linux"]
+
+# Runs once after the server starts or a session is restored: launches the daemon and exits right away.
+[[startup]]
+command = ["/usr/bin/env", "python3", "-E", "-s", "main.py", "start"]
+
+[[actions]]
+id = "start"
+title = "Start eartag daemon"
+description = "Start the daemon if it is not running (does nothing if it already is)"
+command = ["/usr/bin/env", "python3", "-E", "-s", "main.py", "start"]
+
+[[actions]]
+id = "resync"
+title = "Resync tab names"
+description = "Recompute every tab name with the current rules"
+command = ["/usr/bin/env", "python3", "-E", "-s", "main.py", "resync"]
+
+[[actions]]
+id = "stop"
+title = "Stop eartag daemon"
+description = "Stop the running daemon (tab names stay as they are)"
+command = ["/usr/bin/env", "python3", "-E", "-s", "main.py", "stop"]
+
+[[actions]]
+id = "status"
+title = "eartag daemon status"
+description = "Whether the daemon is running, plus recent log lines"
+command = ["/usr/bin/env", "python3", "-E", "-s", "main.py", "status"]

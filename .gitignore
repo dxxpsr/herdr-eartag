@@ -1,0 +1,31 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments (no external dependencies, but one may be created during development)
+.venv/
+venv/
+
+# Plugin runtime output — normally written to ~/.local/state/herdr/plugins/herdr-eartag/,
+# ignored here so it is not committed by accident when the state dir is pointed inside the repo for testing.
+labels.json
+labels-*.json
+.labels-*.tmp
+eartag.log*
+daemon-*.lock
+state-*.lock
+
+# Agent work records (progress notes, review bundles, design and plan docs) — local only
+.superpowers/
+docs/superpowers/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
