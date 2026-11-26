@@ -15,11 +15,22 @@ import socket
 import time
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
-from typing import IO, Dict, Iterator, Optional
+from typing import IO, Dict, Iterator, Optional, Tuple
 
+from .git_branch import current_branch
 from .herdr_client import EventStream, HerdrError, get_process_info, get_snapshot, get_tab, rename_tab
 from .naming import needs_process_info, plan_tabs
-from .state import begin_session, load_state, prune_state, remember_label, save_state
+from .state import (
+    adopt_pinned,
+    begin_session,
+    load_state,
+    pin_tab,
+    prune_state,
+    refresh_pinned,
+    remember_label,
+    save_state,
+    unpin_tab,
+)
 
 logger = logging.getLogger("herdr_eartag")
 
@@ -104,6 +115,22 @@ def _collect_process_infos(socket_path: str, snapshot: dict) -> Dict[str, dict]:
     return infos
 
 
+def _collect_branches(snapshot: dict) -> Dict[str, str]:
+    """git branch per focused pane without an agent (the only labels that show it). Panes outside a repo are left out."""
+    panes_by_id = {p.get("pane_id"): p for p in snapshot.get("panes", [])}
+    branches: Dict[str, str] = {}
+    for layout in snapshot.get("layouts", []):
+        pane_id = layout.get("focused_pane_id")
+        pane = panes_by_id.get(pane_id)
+        if not pane_id or pane is None or not needs_process_info(pane):
+            continue
+        cwd = pane.get("foreground_cwd") or pane.get("cwd")
+        branch = current_branch(cwd) if isinstance(cwd, str) else None
+        if branch:
+            branches[pane_id] = branch
+    return branches
+
+
 def _adopt_legacy_state(state_dir: str, path: str) -> None:
     """Adopt the v1 state file (labels.json, not split per session) into the per-session file.
 
@@ -150,9 +177,19 @@ def reconcile_once(socket_path: str, state_dir: str) -> int:
             {t.get("workspace_id") for t in tabs if t.get("workspace_id")},
             {t.get("tab_id") for t in tabs if t.get("tab_id")},
         )
+        # Pins first: after a restart a pinned tab must be recognized before planning, or it gets renamed.
+        adopt_pinned(state, tabs)
+        refresh_pinned(state, tabs)
 
         process_infos = _collect_process_infos(socket_path, snapshot)
-        plans = plan_tabs(snapshot, state, process_infos, home=os.path.expanduser("~"), local_host=_local_host())
+        plans = plan_tabs(
+            snapshot,
+            state,
+            process_infos,
+            home=os.path.expanduser("~"),
+            local_host=_local_host(),
+            branches=_collect_branches(snapshot),
+        )
 
         changed = 0
         try:
@@ -182,6 +219,53 @@ def reconcile_once(socket_path: str, state_dir: str) -> int:
             if state != stored:
                 save_state(path, state)
         return changed
+
+
+def _tab_workspace(tab: dict, tab_id: str) -> str:
+    """Workspace of a tab. tab.get reports it; the ID prefix ("w1:t2" → "w1") is the fallback."""
+    workspace_id = tab.get("workspace_id")
+    if isinstance(workspace_id, str) and workspace_id:
+        return workspace_id
+    return tab_id.split(":", 1)[0]
+
+
+def pin_tab_now(socket_path: str, state_dir: str, tab_id: str) -> str:
+    """Freeze a tab's current name. Returns that name. Raises HerdrError if the tab cannot be read."""
+    with _state_lock(state_dir, socket_path):
+        tab = get_tab(socket_path, tab_id)
+        label = tab.get("label")
+        if not isinstance(label, str):
+            raise HerdrError(f"Tab has no label: {tab_id}")
+        path = state_file(state_dir, socket_path)
+        state = load_state(path)
+        begin_session(state, server_id(socket_path))
+        pin_tab(state, _tab_workspace(tab, tab_id), tab_id, label)
+        save_state(path, state)
+    logger.info("Tab pinned: %s '%s'", tab_id, label)
+    return label
+
+
+def release_tab_now(socket_path: str, state_dir: str, tab_id: str) -> Tuple[bool, int]:
+    """Hand a tab (pinned or user-named) back to automatic naming and rename it right away.
+
+    Returns (was pinned, number of tabs renamed). Recording the current label as one the plugin set is what
+    makes a user-named tab managed again (is_managed trusts the tab's own record).
+    """
+    with _state_lock(state_dir, socket_path):
+        tab = get_tab(socket_path, tab_id)
+        label = tab.get("label")
+        if not isinstance(label, str):
+            raise HerdrError(f"Tab has no label: {tab_id}")
+        workspace_id = _tab_workspace(tab, tab_id)
+        path = state_file(state_dir, socket_path)
+        state = load_state(path)
+        begin_session(state, server_id(socket_path))
+        was_pinned = unpin_tab(state, workspace_id, tab_id)
+        remember_label(state, workspace_id, tab_id, label)
+        save_state(path, state)
+    logger.info("Tab released: %s '%s' (was pinned: %s)", tab_id, label, was_pinned)
+    # reconcile_once takes the state lock itself, so it must run after the block above has released it.
+    return was_pinned, reconcile_once(socket_path, state_dir)
 
 
 def try_acquire_lock(path: str) -> Optional[IO[str]]:

@@ -7,6 +7,8 @@ Subcommands:
   resync  Fix tab names once, right now
   status  Whether the daemon is running, plus recent log lines
   stop    Stop the daemon
+  pin     Freeze the current tab's name (the plugin stops renaming it)
+  release Hand the current tab back to automatic naming and rename it now
 
 Uses HERDR_SOCKET_PATH and HERDR_PLUGIN_STATE_DIR, which the Herdr plugin runtime provides.
 Environment problems print a message and exit with code 0 so a failed startup does not clutter the Herdr server log.
@@ -27,7 +29,8 @@ if PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, PLUGIN_ROOT)
 
 from eartag import daemon  # noqa: E402
-from eartag.herdr_client import HerdrError  # noqa: E402
+from eartag.herdr_client import HerdrError, get_snapshot  # noqa: E402
+from eartag.plugin_context import invoked_tab_id  # noqa: E402
 
 STATUS_LOG_LINES = 10
 
@@ -84,6 +87,55 @@ def cmd_resync(socket_path: str, state_dir: str) -> int:
         print(f"Could not read or write the state file: {exc}")
         return 0
     print(f"Renamed {changed} tab(s)")
+    return 0
+
+
+def _target_tab(socket_path: str) -> Optional[str]:
+    """The tab the action was invoked from, else the UI-focused tab.
+
+    The focused-tab fallback covers `herdr plugin action invoke` run without a launch context; with several
+    clients attached it may not be the tab the user is looking at, which is why the context comes first.
+    Raises HerdrError when the snapshot cannot be read.
+    """
+    tab_id = invoked_tab_id(os.environ)
+    if tab_id:
+        return tab_id
+    focused = get_snapshot(socket_path).get("focused_tab_id")
+    return focused if isinstance(focused, str) and focused else None
+
+
+def cmd_pin(socket_path: str, state_dir: str) -> int:
+    try:
+        tab_id = _target_tab(socket_path)
+        if tab_id is None:
+            print("Could not tell which tab to pin")
+            return 0
+        label = daemon.pin_tab_now(socket_path, state_dir, tab_id)
+    except HerdrError as exc:
+        print(f"Could not pin the tab: {exc}")
+        return 0
+    except OSError as exc:
+        print(f"Could not read or write the state file: {exc}")
+        return 0
+    print(f"Pinned tab name: '{label}' (run release to hand it back)")
+    return 0
+
+
+def cmd_release(socket_path: str, state_dir: str) -> int:
+    try:
+        tab_id = _target_tab(socket_path)
+        if tab_id is None:
+            print("Could not tell which tab to release")
+            return 0
+        was_pinned, changed = daemon.release_tab_now(socket_path, state_dir, tab_id)
+    except HerdrError as exc:
+        print(f"Could not release the tab: {exc}")
+        return 0
+    except OSError as exc:
+        print(f"Could not read or write the state file: {exc}")
+        return 0
+    origin = "pinned" if was_pinned else "named by hand"
+    print(f"Tab handed back to automatic naming (was {origin}); renamed {changed} tab(s)")
     return 0
 
 
@@ -154,6 +206,8 @@ COMMANDS = {
     "resync": cmd_resync,
     "status": cmd_status,
     "stop": cmd_stop,
+    "pin": cmd_pin,
+    "release": cmd_release,
 }
 
 

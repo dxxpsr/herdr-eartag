@@ -94,5 +94,18 @@ class MainTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
+    def test_pin_and_release_with_missing_socket_exit_zero(self) -> None:
+        for command in ("pin", "release"):
+            with tempfile.TemporaryDirectory() as state_dir:
+                env = {
+                    "PATH": os.environ.get("PATH", ""),
+                    "HERDR_SOCKET_PATH": "/tmp/does-not-exist-eartag.sock",
+                    "HERDR_PLUGIN_STATE_DIR": state_dir,
+                    "HERDR_TAB_ID": "w1:t1",
+                }
+                result = _run([command], env)
+            self.assertEqual(result.returncode, 0, command)
+            self.assertIn("Cannot connect to the Herdr socket", result.stdout + result.stderr, command)
+
 if __name__ == "__main__":
     unittest.main()

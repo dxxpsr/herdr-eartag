@@ -1,12 +1,12 @@
 # herdr-eartag — plugin that renames tabs automatically
-# Priority: user-set name > Claude session name > other agent > ssh/mosh session > running program > folder name
+# Priority: pinned or user-set name > Claude session name > other agent > ssh/mosh session > running program > folder name
 # Commands run with the plugin root as cwd, so main.py is called by a relative path.
 # -E -s: block the user's PYTHON* environment variables and site-packages (standard library only)
 
 id = "herdr-eartag"
 name = "herdr-eartag"
-version = "0.3.0"
-description = "Names tabs after the Claude session, running program, ssh server, or folder"
+version = "0.4.0"
+description = "Names tabs after the Claude session, running program, ssh server, or folder and git branch"
 min_herdr_version = "0.9.5"
 platforms = ["macos", "linux"]
 
@@ -37,3 +37,15 @@ id = "status"
 title = "eartag daemon status"
 description = "Whether the daemon is running, plus recent log lines"
 command = ["/usr/bin/env", "python3", "-E", "-s", "main.py", "status"]
+
+[[actions]]
+id = "pin"
+title = "Pin tab name"
+description = "Keep the current tab's name as is (the plugin stops renaming it)"
+command = ["/usr/bin/env", "python3", "-E", "-s", "main.py", "pin"]
+
+[[actions]]
+id = "release"
+title = "Release tab name"
+description = "Hand the current tab back to automatic naming and rename it now"
+command = ["/usr/bin/env", "python3", "-E", "-s", "main.py", "release"]

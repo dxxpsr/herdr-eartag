@@ -32,15 +32,26 @@ def _snapshot(tabs: List[Tuple[str, str, int, str]], agent: Optional[str] = "cla
 
 
 @contextmanager
-def _herdr(snap: dict, tab_labels: Optional[Dict[str, str]] = None, process_info=None, rename_side_effect=None) -> Iterator[mock.MagicMock]:
+def _herdr(
+    snap: dict,
+    tab_labels: Optional[Dict[str, str]] = None,
+    process_info=None,
+    rename_side_effect=None,
+    server: str = "srv",
+    branch: Optional[str] = None,
+) -> Iterator[mock.MagicMock]:
     """Replace get_snapshot/get_tab/get_process_info/rename_tab. Returns the rename mock."""
     labels = {t["tab_id"]: t["label"] for t in snap["tabs"]}
     labels.update(tab_labels or {})
 
     def fake_get_tab(sock: str, tab_id: str) -> dict:
-        return {"tab_id": tab_id, "label": labels[tab_id]}
+        if tab_id not in labels:
+            raise HerdrError(f"tab not found: {tab_id}")
+        return {"tab_id": tab_id, "label": labels[tab_id], "workspace_id": tab_id.split(":")[0]}
 
-    with mock.patch.object(daemon, "server_id", return_value="srv"), mock.patch.object(
+    with mock.patch.object(daemon, "server_id", return_value=server), mock.patch.object(
+        daemon, "current_branch", return_value=branch
+    ), mock.patch.object(
         daemon, "get_snapshot", return_value=snap
     ), mock.patch.object(
         daemon, "get_tab", side_effect=fake_get_tab
@@ -243,6 +254,70 @@ class ConnectStreamTest(unittest.TestCase):
         started = time.monotonic()
         self.assertIsNone(daemon.connect_stream("/tmp/no-such-eartag.sock", retry_seconds=0.6, interval=0.1))
         self.assertLess(time.monotonic() - started, 2.0)
+
+
+class BranchReconcileTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_reconcile_shows_git_branch_for_shell_pane(self) -> None:
+        with _herdr(_snapshot([("w1:t1", "1", 1, "")], agent=None), branch="dev") as rename:
+            daemon.reconcile_once(SOCK, self.state_dir)
+        rename.assert_called_once_with(SOCK, "w1:t1", "proj ⎇ dev")
+
+    def test_branch_lookup_skipped_for_agent_pane(self) -> None:
+        with _herdr(_snapshot([("w1:t1", "1", 1, "Herdr eartag")]), branch="dev") as rename:
+            daemon.reconcile_once(SOCK, self.state_dir)
+        rename.assert_called_once_with(SOCK, "w1:t1", "Herdr eartag")
+
+
+class PinReleaseTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_pinned_tab_is_not_renamed(self) -> None:
+        snap = _snapshot([("w1:t1", "1", 1, "Herdr eartag")])
+        with _herdr(snap) as rename:
+            self.assertEqual(daemon.pin_tab_now(SOCK, self.state_dir, "w1:t1"), "1")
+            self.assertEqual(daemon.reconcile_once(SOCK, self.state_dir), 0)
+        rename.assert_not_called()
+
+    def test_release_hands_manual_tab_back(self) -> None:
+        snap = _snapshot([("w1:t1", "배포 작업", 1, "Herdr eartag")])
+        with _herdr(snap) as rename:
+            self.assertEqual(daemon.release_tab_now(SOCK, self.state_dir, "w1:t1"), (False, 1))
+        rename.assert_called_once_with(SOCK, "w1:t1", "Herdr eartag")
+
+    def test_release_unpins_and_renames(self) -> None:
+        snap = _snapshot([("w1:t1", "deploy", 1, "Herdr eartag")])
+        with _herdr(snap) as rename:
+            daemon.pin_tab_now(SOCK, self.state_dir, "w1:t1")
+            self.assertEqual(daemon.release_tab_now(SOCK, self.state_dir, "w1:t1"), (True, 1))
+        rename.assert_called_once_with(SOCK, "w1:t1", "Herdr eartag")
+
+    def test_pin_survives_server_restart(self) -> None:
+        # The pinned label is one the plugin set, so without the pin the restart fallback would manage it again.
+        with _herdr(_snapshot([("w1:t1", "1", 1, "Herdr eartag")])):
+            daemon.reconcile_once(SOCK, self.state_dir)
+        with _herdr(_snapshot([("w1:t1", "Herdr eartag", 1, "Herdr eartag")])):
+            daemon.pin_tab_now(SOCK, self.state_dir, "w1:t1")
+        restarted = _snapshot([("w1:t5", "Herdr eartag", 1, "new title")])
+        with _herdr(restarted, server="srv-2") as rename:
+            self.assertEqual(daemon.reconcile_once(SOCK, self.state_dir), 0)
+        rename.assert_not_called()
+
+    def test_pin_unknown_tab_raises(self) -> None:
+        with _herdr(_snapshot([])):
+            with self.assertRaises(HerdrError):
+                daemon.pin_tab_now(SOCK, self.state_dir, "w1:t9")
 
 
 if __name__ == "__main__":

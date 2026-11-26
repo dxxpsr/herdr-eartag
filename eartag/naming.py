@@ -4,7 +4,7 @@ Only functions with no external dependencies (sockets, files) live here. That wa
 can be tested from a single snapshot dict, and the daemon only has to "read snapshot → call this module → apply".
 
 Priority (highest first):
-  user-set name > Claude session name > other agent > ssh/mosh session > running program > folder name
+  pinned or user-set name > Claude session name > other agent > ssh/mosh session > running program > folder name
 """
 from __future__ import annotations
 
@@ -27,6 +27,12 @@ from .activity import (
 MAX_LABEL_WIDTH: int = 30
 ELLIPSIS = "…"
 SEPARATOR = " · "
+# Branch marker between the folder and the branch name (1 cell wide).
+BRANCH_SEPARATOR = " ⎇ "
+# Cap the branch part on its own so a long branch name does not push the folder name out of the label.
+MAX_BRANCH_WIDTH: int = 12
+# Branches that are the usual state of a repo. Showing them only costs width, so they are omitted.
+DEFAULT_BRANCHES = frozenset({"main", "master"})
 
 # Agent identifier Herdr assigns to Claude panes
 CLAUDE_AGENT = "claude"
@@ -47,9 +53,14 @@ def truncate_label(text: str) -> str:
     """Turn newlines and tabs into spaces, trim both ends, then cut to the on-screen width."""
     # Control characters in a terminal title can break the tab bar layout, so replace them with spaces.
     cleaned = " ".join(text.replace("\t", " ").splitlines()).strip()
-    if display_width(cleaned) <= MAX_LABEL_WIDTH:
+    return _cut_to_width(cleaned, MAX_LABEL_WIDTH)
+
+
+def _cut_to_width(cleaned: str, max_width: int) -> str:
+    """Cut text to `max_width` cells, ending with an ellipsis when something was dropped."""
+    if display_width(cleaned) <= max_width:
         return cleaned
-    budget = MAX_LABEL_WIDTH - display_width(ELLIPSIS)
+    budget = max_width - display_width(ELLIPSIS)
     kept: List[str] = []
     used = 0
     for char in cleaned:
@@ -78,6 +89,16 @@ def _join(*parts: str) -> str:
     return truncate_label(SEPARATOR.join(p for p in parts if p))
 
 
+def _with_branch(folder: Optional[str], branch: Optional[str]) -> str:
+    """`folder ⎇ branch`. The branch is dropped outside a repo, on a default branch, or with no folder."""
+    if not folder:
+        return ""
+    if not branch or branch in DEFAULT_BRANCHES:
+        return folder
+    cleaned = " ".join(branch.split())  # a branch name has no whitespace, but stay safe for the tab bar
+    return folder + BRANCH_SEPARATOR + _cut_to_width(cleaned, MAX_BRANCH_WIDTH)
+
+
 def _remote_label(program: str, argv: List[str], title: str, folder: Optional[str], local_host: str) -> str:
     """ssh/mosh label: `server · remote folder` if the remote location is known, otherwise `ssh · server`."""
     target = ssh_target(program, argv)
@@ -94,8 +115,13 @@ def desired_label(
     process_info: Optional[dict] = None,
     home: Optional[str] = None,
     local_host: str = "",
+    branch: Optional[str] = None,
 ) -> Optional[str]:
-    """Compute the desired tab label from pane state. None if there is nothing to go on (leave the tab alone)."""
+    """Compute the desired tab label from pane state. None if there is nothing to go on (leave the tab alone).
+
+    branch: git branch of the pane's folder (None outside a repo). Only shell and program labels show it:
+    an agent title already says what the tab is about, and an ssh label is about the remote side.
+    """
     # A cd inside the shell shows up in foreground_cwd, so prefer it.
     cwd = pane.get("foreground_cwd") or pane.get("cwd")
     folder = folder_label(cwd, home) if cwd else None
@@ -116,9 +142,9 @@ def desired_label(
         if program in REMOTE_PROGRAMS:
             argv = command_argv(leader) if leader else []
             return _remote_label(program, argv, pane.get("terminal_title_stripped") or "", folder, local_host)
-        return _join(program, folder or "")
+        return _join(program, _with_branch(folder, branch))
 
-    return truncate_label(folder) if folder else None
+    return truncate_label(_with_branch(folder, branch)) if folder else None
 
 
 def is_managed(tab: dict, position: int, record: Optional[Collection[str]], workspace_labels: Collection[str]) -> bool:
@@ -151,14 +177,18 @@ def plan_tabs(
     process_infos: Optional[Dict[str, dict]] = None,
     home: Optional[str] = None,
     local_host: str = "",
+    branches: Optional[Dict[str, str]] = None,
 ) -> List[TabPlan]:
     """Compute the current and desired label for every managed tab.
 
     Unchanged tabs are returned too: the daemon must refresh their records every time, or a long-unchanged tab
     gets pushed out of the record and freezes as a "user-set name".
     process_infos: focused pane ID → pane.process_info result (missing ones fall back to the folder name rule).
+    branches: focused pane ID → git branch of its folder (missing means no branch is shown).
+    Pinned tabs (pin action) are skipped entirely, even when their label is the default position number.
     """
     process_infos = process_infos or {}
+    branches = branches or {}
     workspaces = state.get("workspaces", {})
     # Build lookup dicts once instead of scanning linearly per tab.
     panes_by_id = {p.get("pane_id"): p for p in snapshot.get("panes", [])}
@@ -177,6 +207,8 @@ def plan_tabs(
         if not tab_id or not isinstance(label, str):
             continue
         entry = workspaces.get(workspace_id) or {}
+        if tab_id in (entry.get("pinned") or {}):
+            continue
         record = (entry.get("tabs") or {}).get(tab_id)
         if not is_managed(tab, positions[workspace_id], record, entry.get("labels") or []):
             continue
@@ -185,7 +217,13 @@ def plan_tabs(
         pane = panes_by_id.get(pane_id)
         if pane is None:
             continue
-        desired = desired_label(pane, process_infos.get(pane_id or ""), home=home, local_host=local_host)
+        desired = desired_label(
+            pane,
+            process_infos.get(pane_id or ""),
+            home=home,
+            local_host=local_host,
+            branch=branches.get(pane_id or ""),
+        )
         plans.append((tab_id, workspace_id, label, desired))
     return plans
 
@@ -196,10 +234,11 @@ def plan_renames(
     process_infos: Optional[Dict[str, dict]] = None,
     home: Optional[str] = None,
     local_host: str = "",
+    branches: Optional[Dict[str, str]] = None,
 ) -> List[Tuple[str, str]]:
     """The (tab_id, new_label) pairs to rename. Same-label renames are excluded since they only add events."""
     return [
         (tab_id, desired)
-        for tab_id, _ws, current, desired in plan_tabs(snapshot, state, process_infos, home, local_host)
+        for tab_id, _ws, current, desired in plan_tabs(snapshot, state, process_infos, home, local_host, branches)
         if desired is not None and desired != current
     ]

@@ -8,7 +8,9 @@ Format (v3):
     "workspaces": {
       "w1": {
         "labels": ["label", ...],                 # labels the plugin set in this workspace (latest 50)
-        "tabs": {"w1:t1": ["previous", "latest"]} # the 2 latest labels the plugin set, per tab
+        "tabs": {"w1:t1": ["previous", "latest"]},  # the 2 latest labels the plugin set, per tab
+        "pinned": {"w1:t2": "label"},               # tabs frozen by the pin action (optional key)
+        "pinned_labels": ["label", ...]             # pins waiting to be matched again after a restart (optional key)
       }
     }
   }
@@ -18,6 +20,9 @@ Rules
   is not overwritten even if it matches an old plugin label.
 - Tab records are cleared when the Herdr server changes (tab IDs may be reassigned after a restart). Then
   the workspace label list is used instead, so auto management does not freeze after a restart.
+- Pinned tabs are never renamed, whatever their label (even the default position number).
+  On a server change their IDs are no longer valid, so the pins become `pinned_labels` and are matched
+  back to a live tab with the same label on the next recompute (adopt_pinned).
 - Why 2 labels per tab: the new label is recorded right before the rename, so even if the rename fails or
   times out, the current label is still on record and the tab does not freeze.
 """
@@ -35,6 +40,8 @@ logger = logging.getLogger(__name__)
 MAX_LABELS_PER_WORKSPACE = 50
 # Recent labels to remember per tab
 MAX_LABELS_PER_TAB = 2
+# Pins waiting for a restart match. A pin whose tab did not come back would otherwise linger forever.
+MAX_PINNED_LABELS = 20
 
 State = dict  # {"server": Optional[str], "workspaces": Dict[str, {"labels": List[str], "tabs": Dict[str, List[str]]}]}
 
@@ -67,7 +74,19 @@ def _normalize(data: dict) -> State:
                 for tab_id, labels in (tabs_raw.items() if isinstance(tabs_raw, dict) else [])
                 if isinstance(tab_id, str) and _str_list(labels)
             }
-            state["workspaces"][ws] = {"labels": _str_list(entry.get("labels"))[-MAX_LABELS_PER_WORKSPACE:], "tabs": tabs}
+            normalized: dict = {"labels": _str_list(entry.get("labels"))[-MAX_LABELS_PER_WORKSPACE:], "tabs": tabs}
+            pinned_raw = entry.get("pinned")
+            pinned = {
+                tab_id: label
+                for tab_id, label in (pinned_raw.items() if isinstance(pinned_raw, dict) else [])
+                if isinstance(tab_id, str) and isinstance(label, str)
+            }
+            if pinned:
+                normalized["pinned"] = pinned
+            pinned_labels = _str_list(entry.get("pinned_labels"))[-MAX_PINNED_LABELS:]
+            if pinned_labels:
+                normalized["pinned_labels"] = pinned_labels
+            state["workspaces"][ws] = normalized
         return state
 
     for key, value in data.items():
@@ -145,12 +164,69 @@ def workspace_labels(state: State, workspace_id: str) -> List[str]:
 
 
 def begin_session(state: State, server_id: Optional[str]) -> None:
-    """Clear tab records if the Herdr server changed (restart). Leave them alone if the server id is unknown."""
+    """Clear tab records if the Herdr server changed (restart). Leave them alone if the server id is unknown.
+
+    Pins are keyed by tab ID too, so they are turned into labels to be matched again (adopt_pinned).
+    """
     if server_id is None or state.get("server") == server_id:
         return
     for entry in state["workspaces"].values():
         entry["tabs"] = {}
+        pinned = entry.pop("pinned", None) or {}
+        if pinned:
+            waiting = list(entry.get("pinned_labels") or []) + list(pinned.values())
+            entry["pinned_labels"] = waiting[-MAX_PINNED_LABELS:]
     state["server"] = server_id
+
+
+def pin_tab(state: State, workspace_id: str, tab_id: str, label: str) -> None:
+    """Freeze a tab: the daemon leaves it alone until it is released."""
+    _workspace(state, workspace_id).setdefault("pinned", {})[tab_id] = label
+
+
+def unpin_tab(state: State, workspace_id: str, tab_id: str) -> bool:
+    """Release a pinned tab. False if it was not pinned."""
+    entry = state["workspaces"].get(workspace_id)
+    pinned = entry.get("pinned") if entry else None
+    if not pinned or tab_id not in pinned:
+        return False
+    del pinned[tab_id]
+    return True
+
+
+def is_pinned(state: State, workspace_id: str, tab_id: str) -> bool:
+    entry = state["workspaces"].get(workspace_id)
+    return bool(entry) and tab_id in (entry.get("pinned") or {})
+
+
+def refresh_pinned(state: State, tabs: List[dict]) -> None:
+    """Keep each pin's label equal to the tab's current label (the user may rename a pinned tab).
+
+    The label is the only thing that can find the tab again after a restart, so a stale one would lose the pin.
+    """
+    for tab in tabs:
+        entry = state["workspaces"].get(tab.get("workspace_id") or "")
+        pinned = entry.get("pinned") if entry else None
+        tab_id, label = tab.get("tab_id"), tab.get("label")
+        if pinned and tab_id in pinned and isinstance(label, str):
+            pinned[tab_id] = label
+
+
+def adopt_pinned(state: State, tabs: List[dict]) -> None:
+    """After a restart, pin the live tabs whose label matches a waiting pin. Each waiting pin is used once.
+
+    Tabs are visited in tab bar order, so with two same-named tabs the leftmost one gets the pin.
+    """
+    for tab in tabs:
+        entry = state["workspaces"].get(tab.get("workspace_id") or "")
+        waiting = entry.get("pinned_labels") if entry else None
+        tab_id, label = tab.get("tab_id"), tab.get("label")
+        if not waiting or not isinstance(tab_id, str) or label not in waiting:
+            continue
+        if tab_id in (entry.get("pinned") or {}):
+            continue
+        waiting.remove(label)
+        entry.setdefault("pinned", {})[tab_id] = label
 
 
 def prune_state(state: State, live_workspace_ids: Set[str], live_tab_ids: Set[str]) -> None:
@@ -158,3 +234,5 @@ def prune_state(state: State, live_workspace_ids: Set[str], live_tab_ids: Set[st
     state["workspaces"] = {ws: entry for ws, entry in state["workspaces"].items() if ws in live_workspace_ids}
     for entry in state["workspaces"].values():
         entry["tabs"] = {tab_id: labels for tab_id, labels in entry["tabs"].items() if tab_id in live_tab_ids}
+        if "pinned" in entry:
+            entry["pinned"] = {tab_id: label for tab_id, label in entry["pinned"].items() if tab_id in live_tab_ids}

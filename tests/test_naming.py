@@ -13,6 +13,7 @@ from eartag.naming import (
     is_managed,
     needs_process_info,
     plan_renames,
+    plan_tabs,
     truncate_label,
 )
 
@@ -116,6 +117,35 @@ class ActivityLabelTest(unittest.TestCase):
     def test_needs_process_info(self) -> None:
         self.assertTrue(needs_process_info({"agent": None}))
         self.assertFalse(needs_process_info({"agent": "claude"}))
+
+
+class BranchLabelTest(unittest.TestCase):
+    """The git branch is appended to the folder part of shell and program labels."""
+
+    BASE = {"agent": None, "terminal_title_stripped": "", "foreground_cwd": "/w/proj"}
+
+    def test_idle_shell_with_branch(self) -> None:
+        self.assertEqual(desired_label(self.BASE, _proc_info(ZSH), branch="fix-login"), "proj ⎇ fix-login")
+
+    def test_program_with_branch(self) -> None:
+        self.assertEqual(desired_label(self.BASE, _proc_info(VIM), branch="fix-login"), "vim · proj ⎇ fix-login")
+
+    def test_default_branches_are_omitted(self) -> None:
+        # main/master is the usual state, so showing it only costs width.
+        self.assertEqual(desired_label(self.BASE, _proc_info(ZSH), branch="main"), "proj")
+        self.assertEqual(desired_label(self.BASE, _proc_info(ZSH), branch="master"), "proj")
+
+    def test_long_branch_is_cut_to_its_own_budget(self) -> None:
+        self.assertEqual(
+            desired_label(self.BASE, _proc_info(ZSH), branch="feature/login-redesign"), "proj ⎇ feature/log…"
+        )
+
+    def test_branch_not_added_to_agent_or_remote_labels(self) -> None:
+        claude = {**self.BASE, "agent": "claude", "terminal_title_stripped": "Herdr eartag"}
+        self.assertEqual(desired_label(claude, branch="fix-login"), "Herdr eartag")
+        self.assertEqual(desired_label({**self.BASE, "agent": "codex"}, branch="fix-login"), "codex · proj")
+        ssh = _proc_info({"pid": 1, "name": "ssh", "argv0": "ssh", "argv": ["ssh", "prod"]})
+        self.assertEqual(desired_label(self.BASE, ssh, local_host="mac", branch="fix-login"), "ssh · prod")
 
 
 def _state(ws_labels: Optional[dict] = None, tabs: Optional[dict] = None) -> dict:
@@ -231,6 +261,24 @@ class PlanRenamesTest(unittest.TestCase):
             "panes": [],
         }
         self.assertEqual(plan_renames(snapshot, _state()), [])
+
+
+    def test_plan_renames_uses_branches(self) -> None:
+        snapshot = {
+            "tabs": [{"tab_id": "w1:t1", "label": "1", "number": 1, "workspace_id": "w1"}],
+            "layouts": [{"tab_id": "w1:t1", "focused_pane_id": "p1"}],
+            "panes": [{"pane_id": "p1", "agent": None, "terminal_title_stripped": "", "foreground_cwd": "/w/proj"}],
+        }
+        self.assertEqual(
+            plan_renames(snapshot, _state(), {"p1": _proc_info(ZSH)}, branches={"p1": "dev"}), [("w1:t1", "proj ⎇ dev")]
+        )
+
+    def test_pinned_tab_is_never_planned(self) -> None:
+        # Even the default position label is left alone once the tab is pinned.
+        snapshot = _snapshot()
+        state = _state({"w1": ["proj"]})
+        state["workspaces"]["w1"]["pinned"] = {"w1:t1": "1", "w1:t3": "proj"}
+        self.assertEqual(plan_tabs(snapshot, state), [])
 
 
 if __name__ == "__main__":

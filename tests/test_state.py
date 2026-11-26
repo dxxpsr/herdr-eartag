@@ -11,12 +11,17 @@ import unittest
 
 from eartag.state import (
     MAX_LABELS_PER_WORKSPACE,
+    adopt_pinned,
     begin_session,
+    is_pinned,
     load_state,
+    pin_tab,
     prune_state,
+    refresh_pinned,
     remember_label,
     save_state,
     tab_record,
+    unpin_tab,
     workspace_labels,
 )
 
@@ -114,6 +119,61 @@ class StateOpsTest(unittest.TestCase):
         self.assertEqual(list(self.state["workspaces"]), ["w1"])
         self.assertIsNone(tab_record(self.state, "w1", "w1:t2"))
         self.assertEqual(workspace_labels(self.state, "w1"), ["a", "b"])
+
+
+class PinStateTest(unittest.TestCase):
+    """Pinned tabs: frozen names the daemon never touches, surviving a Herdr restart."""
+
+    def setUp(self) -> None:
+        self.state = {"server": "srv-1", "workspaces": {}}
+
+    def test_pin_and_unpin(self) -> None:
+        pin_tab(self.state, "w1", "w1:t1", "deploy")
+        self.assertTrue(is_pinned(self.state, "w1", "w1:t1"))
+        self.assertTrue(unpin_tab(self.state, "w1", "w1:t1"))
+        self.assertFalse(is_pinned(self.state, "w1", "w1:t1"))
+        self.assertFalse(unpin_tab(self.state, "w1", "w1:t1"))  # already released → reports nothing changed
+
+    def test_unpin_unknown_workspace(self) -> None:
+        self.assertFalse(unpin_tab(self.state, "w9", "w9:t1"))
+
+    def test_refresh_pinned_follows_current_label(self) -> None:
+        # The label is what lets a pinned tab be found again after a restart, so keep it current.
+        pin_tab(self.state, "w1", "w1:t1", "old")
+        refresh_pinned(self.state, [{"tab_id": "w1:t1", "workspace_id": "w1", "label": "new"}])
+        self.assertEqual(_ws(self.state, "w1")["pinned"], {"w1:t1": "new"})
+
+    def test_restart_moves_pins_to_labels_and_adopts_them(self) -> None:
+        pin_tab(self.state, "w1", "w1:t1", "deploy")
+        begin_session(self.state, "srv-2")
+        self.assertFalse(is_pinned(self.state, "w1", "w1:t1"))  # old IDs may now belong to other tabs
+        tabs = [
+            {"tab_id": "w1:t7", "workspace_id": "w1", "label": "other"},
+            {"tab_id": "w1:t8", "workspace_id": "w1", "label": "deploy"},
+            {"tab_id": "w1:t9", "workspace_id": "w1", "label": "deploy"},
+        ]
+        adopt_pinned(self.state, tabs)
+        self.assertTrue(is_pinned(self.state, "w1", "w1:t8"))
+        # One saved pin is consumed by one tab, so a same-named second tab is not pinned too.
+        self.assertFalse(is_pinned(self.state, "w1", "w1:t9"))
+        self.assertFalse(is_pinned(self.state, "w1", "w1:t7"))
+        self.assertEqual(_ws(self.state, "w1").get("pinned_labels"), [])
+
+    def test_prune_drops_pins_of_closed_tabs(self) -> None:
+        pin_tab(self.state, "w1", "w1:t1", "a")
+        pin_tab(self.state, "w1", "w1:t2", "b")
+        prune_state(self.state, {"w1"}, {"w1:t1"})
+        self.assertEqual(_ws(self.state, "w1")["pinned"], {"w1:t1": "a"})
+
+    def test_pins_survive_save_and_load(self) -> None:
+        pin_tab(self.state, "w1", "w1:t1", "a")
+        self.state["workspaces"]["w1"]["pinned_labels"] = ["b"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "labels.json")
+            save_state(path, self.state)
+            loaded = load_state(path)
+        self.assertEqual(_ws(loaded, "w1")["pinned"], {"w1:t1": "a"})
+        self.assertEqual(_ws(loaded, "w1")["pinned_labels"], ["b"])
 
 
 if __name__ == "__main__":
