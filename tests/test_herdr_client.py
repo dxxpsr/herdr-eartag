@@ -136,5 +136,16 @@ class EventStreamTest(unittest.TestCase):
             server.close()
 
 
+class SubscribedEventsTest(unittest.TestCase):
+    def test_no_pane_scoped_subscriptions(self) -> None:
+        # Observed (Herdr 0.9.5): these types require a pane_id, and one invalid entry makes the whole
+        # events.subscribe fail ("missing field `pane_id`"), which stops the daemon.
+        from eartag.herdr_client import SUBSCRIBED_EVENTS
+
+        pane_scoped = {"pane.agent_status_changed", "pane.output_matched", "pane.scroll_changed"}
+        self.assertFalse(pane_scoped & set(SUBSCRIBED_EVENTS))
+        self.assertIn("workspace.updated", SUBSCRIBED_EVENTS)
+
+
 if __name__ == "__main__":
     unittest.main()

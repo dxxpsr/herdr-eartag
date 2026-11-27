@@ -5,8 +5,8 @@
 
 id = "herdr-eartag"
 name = "herdr-eartag"
-version = "0.4.0"
-description = "Names tabs after the Claude session, running program, ssh server, or folder and git branch"
+version = "0.5.0"
+description = "Names tabs after the Claude session, running program, ssh server, or folder, with an agent status mark"
 min_herdr_version = "0.9.5"
 platforms = ["macos", "linux"]
 

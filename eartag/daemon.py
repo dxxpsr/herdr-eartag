@@ -17,9 +17,8 @@ from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 from typing import IO, Dict, Iterator, Optional, Tuple
 
-from .git_branch import current_branch
 from .herdr_client import EventStream, HerdrError, get_process_info, get_snapshot, get_tab, rename_tab
-from .naming import needs_process_info, plan_tabs
+from .naming import needs_process_info, plan_tabs, strip_status
 from .state import (
     adopt_pinned,
     begin_session,
@@ -115,22 +114,6 @@ def _collect_process_infos(socket_path: str, snapshot: dict) -> Dict[str, dict]:
     return infos
 
 
-def _collect_branches(snapshot: dict) -> Dict[str, str]:
-    """git branch per focused pane without an agent (the only labels that show it). Panes outside a repo are left out."""
-    panes_by_id = {p.get("pane_id"): p for p in snapshot.get("panes", [])}
-    branches: Dict[str, str] = {}
-    for layout in snapshot.get("layouts", []):
-        pane_id = layout.get("focused_pane_id")
-        pane = panes_by_id.get(pane_id)
-        if not pane_id or pane is None or not needs_process_info(pane):
-            continue
-        cwd = pane.get("foreground_cwd") or pane.get("cwd")
-        branch = current_branch(cwd) if isinstance(cwd, str) else None
-        if branch:
-            branches[pane_id] = branch
-    return branches
-
-
 def _adopt_legacy_state(state_dir: str, path: str) -> None:
     """Adopt the v1 state file (labels.json, not split per session) into the per-session file.
 
@@ -178,8 +161,10 @@ def reconcile_once(socket_path: str, state_dir: str) -> int:
             {t.get("tab_id") for t in tabs if t.get("tab_id")},
         )
         # Pins first: after a restart a pinned tab must be recognized before planning, or it gets renamed.
-        adopt_pinned(state, tabs)
-        refresh_pinned(state, tabs)
+        # Pins are matched by name, so compare without the status mark (it changes with the agent status).
+        named_tabs = [{**t, "label": strip_status(t["label"])} if isinstance(t.get("label"), str) else t for t in tabs]
+        adopt_pinned(state, named_tabs)
+        refresh_pinned(state, named_tabs)
 
         process_infos = _collect_process_infos(socket_path, snapshot)
         plans = plan_tabs(
@@ -188,15 +173,17 @@ def reconcile_once(socket_path: str, state_dir: str) -> int:
             process_infos,
             home=os.path.expanduser("~"),
             local_host=_local_host(),
-            branches=_collect_branches(snapshot),
         )
 
         changed = 0
         try:
-            for tab_id, workspace_id, current, desired in plans:
+            for plan in plans:
+                tab_id, current, desired = plan.tab_id, plan.current, plan.desired
                 # Refresh the record even for unchanged tabs, so a long-unchanged tab is not pushed out of the record and frozen.
-                remember_label(state, workspace_id, tab_id, current)
-                if desired is None or desired == current:
+                # Pinned and user-set tabs are never recorded: that would turn them into plugin-managed tabs.
+                if plan.managed:
+                    remember_label(state, plan.workspace_id, tab_id, plan.current_name)
+                if desired == current:
                     continue
                 try:
                     # The user may have renamed the tab after the snapshot was read, so check again right before renaming.
@@ -205,7 +192,8 @@ def reconcile_once(socket_path: str, state_dir: str) -> int:
                         logger.info("Tab renamed in the meantime, skipping: %s '%s'", tab_id, latest)
                         continue
                     # Record before renaming: if the reply times out after the rename applied, the new label is still on record and does not freeze.
-                    remember_label(state, workspace_id, tab_id, desired)
+                    if plan.managed:
+                        remember_label(state, plan.workspace_id, tab_id, plan.desired_name)
                     rename_tab(socket_path, tab_id, desired)
                 except HerdrError as exc:
                     # One failing tab (closed in the meantime, etc.) does not stop the others.
@@ -239,10 +227,11 @@ def pin_tab_now(socket_path: str, state_dir: str, tab_id: str) -> str:
         path = state_file(state_dir, socket_path)
         state = load_state(path)
         begin_session(state, server_id(socket_path))
-        pin_tab(state, _tab_workspace(tab, tab_id), tab_id, label)
+        # Store the name without the status mark: the mark keeps changing, the name is what gets frozen.
+        pin_tab(state, _tab_workspace(tab, tab_id), tab_id, strip_status(label))
         save_state(path, state)
     logger.info("Tab pinned: %s '%s'", tab_id, label)
-    return label
+    return strip_status(label)
 
 
 def release_tab_now(socket_path: str, state_dir: str, tab_id: str) -> Tuple[bool, int]:
@@ -261,7 +250,7 @@ def release_tab_now(socket_path: str, state_dir: str, tab_id: str) -> Tuple[bool
         state = load_state(path)
         begin_session(state, server_id(socket_path))
         was_pinned = unpin_tab(state, workspace_id, tab_id)
-        remember_label(state, workspace_id, tab_id, label)
+        remember_label(state, workspace_id, tab_id, strip_status(label))
         save_state(path, state)
     logger.info("Tab released: %s '%s' (was pinned: %s)", tab_id, label, was_pinned)
     # reconcile_once takes the state lock itself, so it must run after the block above has released it.

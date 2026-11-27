@@ -20,12 +20,16 @@ from eartag.state import empty_state, load_state, remember_label, save_state, ta
 SOCK = "/tmp/fake-herdr.sock"
 
 
-def _snapshot(tabs: List[Tuple[str, str, int, str]], agent: Optional[str] = "claude") -> dict:
-    """Build a minimal snapshot from a list of (tab_id, label, number, title)."""
+def _snapshot(
+    tabs: List[Tuple[str, str, int, str]], agent: Optional[str] = "claude", status: Optional[str] = None
+) -> dict:
+    """Build a minimal snapshot from a list of (tab_id, label, number, title). status: tab.agent_status for every tab."""
     snap: dict = {"tabs": [], "layouts": [], "panes": []}
     for i, (tab_id, label, number, title) in enumerate(tabs):
         pane_id = f"p{i}"
-        snap["tabs"].append({"tab_id": tab_id, "label": label, "number": number, "workspace_id": tab_id.split(":")[0]})
+        snap["tabs"].append(
+            {"tab_id": tab_id, "label": label, "number": number, "workspace_id": tab_id.split(":")[0], "agent_status": status}
+        )
         snap["layouts"].append({"tab_id": tab_id, "focused_pane_id": pane_id})
         snap["panes"].append({"pane_id": pane_id, "agent": agent, "terminal_title_stripped": title, "foreground_cwd": "/w/proj"})
     return snap
@@ -38,7 +42,6 @@ def _herdr(
     process_info=None,
     rename_side_effect=None,
     server: str = "srv",
-    branch: Optional[str] = None,
 ) -> Iterator[mock.MagicMock]:
     """Replace get_snapshot/get_tab/get_process_info/rename_tab. Returns the rename mock."""
     labels = {t["tab_id"]: t["label"] for t in snap["tabs"]}
@@ -50,8 +53,6 @@ def _herdr(
         return {"tab_id": tab_id, "label": labels[tab_id], "workspace_id": tab_id.split(":")[0]}
 
     with mock.patch.object(daemon, "server_id", return_value=server), mock.patch.object(
-        daemon, "current_branch", return_value=branch
-    ), mock.patch.object(
         daemon, "get_snapshot", return_value=snap
     ), mock.patch.object(
         daemon, "get_tab", side_effect=fake_get_tab
@@ -256,25 +257,6 @@ class ConnectStreamTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2.0)
 
 
-class BranchReconcileTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.state_dir = self._tmp.name
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
-
-    def test_reconcile_shows_git_branch_for_shell_pane(self) -> None:
-        with _herdr(_snapshot([("w1:t1", "1", 1, "")], agent=None), branch="dev") as rename:
-            daemon.reconcile_once(SOCK, self.state_dir)
-        rename.assert_called_once_with(SOCK, "w1:t1", "proj ⎇ dev")
-
-    def test_branch_lookup_skipped_for_agent_pane(self) -> None:
-        with _herdr(_snapshot([("w1:t1", "1", 1, "Herdr eartag")]), branch="dev") as rename:
-            daemon.reconcile_once(SOCK, self.state_dir)
-        rename.assert_called_once_with(SOCK, "w1:t1", "Herdr eartag")
-
-
 class PinReleaseTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -318,6 +300,56 @@ class PinReleaseTest(unittest.TestCase):
         with _herdr(_snapshot([])):
             with self.assertRaises(HerdrError):
                 daemon.pin_tab_now(SOCK, self.state_dir, "w1:t9")
+
+
+class StatusMarkReconcileTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = self._tmp.name
+        self.state_path = daemon.state_file(self.state_dir, SOCK)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_records_names_without_mark(self) -> None:
+        with _herdr(_snapshot([("w1:t1", "1", 1, "Herdr eartag")], status="working")) as rename:
+            daemon.reconcile_once(SOCK, self.state_dir)
+        rename.assert_called_once_with(SOCK, "w1:t1", "◐ Herdr eartag")
+        state = load_state(self.state_path)
+        self.assertEqual(tab_record(state, "w1", "w1:t1"), ["1", "Herdr eartag"])
+        self.assertEqual(workspace_labels(state, "w1"), ["Herdr eartag"])
+
+    def test_mark_change_keeps_tab_managed(self) -> None:
+        with _herdr(_snapshot([("w1:t1", "1", 1, "Herdr eartag")], status="working")):
+            daemon.reconcile_once(SOCK, self.state_dir)
+        with _herdr(_snapshot([("w1:t1", "◐ Herdr eartag", 1, "새 제목")], status="idle")) as rename:
+            daemon.reconcile_once(SOCK, self.state_dir)
+        rename.assert_called_once_with(SOCK, "w1:t1", "○ 새 제목")
+
+    def test_manual_tab_is_marked_but_not_adopted(self) -> None:
+        with _herdr(_snapshot([("w1:t1", "배포 작업", 1, "Herdr eartag")], status="working")) as rename:
+            daemon.reconcile_once(SOCK, self.state_dir)
+        rename.assert_called_once_with(SOCK, "w1:t1", "◐ 배포 작업")
+        state = load_state(self.state_path)
+        self.assertIsNone(tab_record(state, "w1", "w1:t1"))
+        self.assertNotIn("배포 작업", workspace_labels(state, "w1"))
+
+    def test_pin_and_release_use_names_without_mark(self) -> None:
+        snap = _snapshot([("w1:t1", "◐ 배포 작업", 1, "Herdr eartag")], status="working")
+        with _herdr(snap) as rename:
+            daemon.pin_tab_now(SOCK, self.state_dir, "w1:t1")
+            self.assertEqual(load_state(self.state_path)["workspaces"]["w1"]["pinned"], {"w1:t1": "배포 작업"})
+            daemon.release_tab_now(SOCK, self.state_dir, "w1:t1")
+        rename.assert_called_once_with(SOCK, "w1:t1", "◐ Herdr eartag")
+        self.assertEqual(tab_record(load_state(self.state_path), "w1", "w1:t1"), ["배포 작업", "Herdr eartag"])
+
+    def test_pin_found_by_name_after_restart_even_with_new_mark(self) -> None:
+        with _herdr(_snapshot([("w1:t1", "deploy", 1, "Herdr eartag")])):
+            daemon.pin_tab_now(SOCK, self.state_dir, "w1:t1")
+        restarted = _snapshot([("w1:t5", "○ deploy", 1, "Herdr eartag")], status="working")
+        with _herdr(restarted, server="srv-2") as rename:
+            daemon.reconcile_once(SOCK, self.state_dir)
+        rename.assert_called_once_with(SOCK, "w1:t5", "◐ deploy")
 
 
 if __name__ == "__main__":

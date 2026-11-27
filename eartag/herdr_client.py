@@ -23,6 +23,9 @@ SUBSCRIBED_EVENTS: List[str] = [
     "tab.focused",
     "tab.renamed",  # detects when the user renames a tab
     "layout.updated",
+    # Agent status changes (the mark in front of the tab name). pane.agent_status_changed cannot be used:
+    # it must name one pane_id, and an invalid subscription makes the whole events.subscribe fail.
+    "workspace.updated",
 ]
 
 _request_ids = itertools.count(1)

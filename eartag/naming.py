@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import unicodedata
-from typing import Collection, Dict, List, Optional, Tuple
+from typing import Collection, Dict, List, NamedTuple, Optional, Tuple
 
 from .activity import (
     REMOTE_PROGRAMS,
@@ -27,15 +27,24 @@ from .activity import (
 MAX_LABEL_WIDTH: int = 30
 ELLIPSIS = "…"
 SEPARATOR = " · "
-# Branch marker between the folder and the branch name (1 cell wide).
-BRANCH_SEPARATOR = " ⎇ "
-# Cap the branch part on its own so a long branch name does not push the folder name out of the label.
-MAX_BRANCH_WIDTH: int = 12
-# Branches that are the usual state of a repo. Showing them only costs width, so they are omitted.
-DEFAULT_BRANCHES = frozenset({"main", "master"})
 
 # Agent identifier Herdr assigns to Claude panes
 CLAUDE_AGENT = "claude"
+
+# One-cell mark per tab agent status (tab.agent_status), shown as "<mark> <name>".
+# Herdr shows agent status only in its sidebar, so the tab bar needs this to tell agent tabs apart.
+# The glyphs are Herdr's own (sidebar with status_indicators = "symbols", observed in Herdr 0.9.5 as
+# "× ◐ ✓ ○ ·" for blocked, working, done, idle, unknown), so the tab bar and the sidebar read the same.
+# "unknown" (no agent in the tab) gets no mark rather than Herdr's "·", to keep plain tabs unchanged.
+STATUS_MARKS: Dict[str, str] = {
+    "working": "◐",
+    "blocked": "×",
+    "done": "✓",
+    "idle": "○",
+}
+# Marks used by v0.5.0. Still stripped so tabs that carry them get the new mark instead of a stacked one.
+PREVIOUS_MARKS = ("✻", "!", "✳")
+_MARK_PREFIXES = tuple(f"{mark} " for mark in (*STATUS_MARKS.values(), *PREVIOUS_MARKS))
 
 
 def _char_width(char: str) -> int:
@@ -72,6 +81,20 @@ def _cut_to_width(cleaned: str, max_width: int) -> str:
     return "".join(kept).rstrip() + ELLIPSIS
 
 
+def with_status(name: str, status: Optional[str]) -> str:
+    """Put the status mark in front of a name. Unknown status (no agent in the tab) → the name as is."""
+    mark = STATUS_MARKS.get(status or "")
+    return f"{mark} {name}" if mark else name
+
+
+def strip_status(label: str) -> str:
+    """The name without the plugin's status mark. Only one mark (plus its space) is ours."""
+    for prefix in _MARK_PREFIXES:
+        if label.startswith(prefix):
+            return label[len(prefix):]
+    return label
+
+
 def folder_label(path: str, home: Optional[str] = None) -> str:
     """The last folder name in a path. `/` for the root, `~` for the home folder."""
     trimmed = path.rstrip("/")
@@ -87,16 +110,6 @@ def needs_process_info(pane: dict) -> bool:
 
 def _join(*parts: str) -> str:
     return truncate_label(SEPARATOR.join(p for p in parts if p))
-
-
-def _with_branch(folder: Optional[str], branch: Optional[str]) -> str:
-    """`folder ⎇ branch`. The branch is dropped outside a repo, on a default branch, or with no folder."""
-    if not folder:
-        return ""
-    if not branch or branch in DEFAULT_BRANCHES:
-        return folder
-    cleaned = " ".join(branch.split())  # a branch name has no whitespace, but stay safe for the tab bar
-    return folder + BRANCH_SEPARATOR + _cut_to_width(cleaned, MAX_BRANCH_WIDTH)
 
 
 def _remote_label(program: str, argv: List[str], title: str, folder: Optional[str], local_host: str) -> str:
@@ -115,13 +128,8 @@ def desired_label(
     process_info: Optional[dict] = None,
     home: Optional[str] = None,
     local_host: str = "",
-    branch: Optional[str] = None,
 ) -> Optional[str]:
-    """Compute the desired tab label from pane state. None if there is nothing to go on (leave the tab alone).
-
-    branch: git branch of the pane's folder (None outside a repo). Only shell and program labels show it:
-    an agent title already says what the tab is about, and an ssh label is about the remote side.
-    """
+    """Compute the desired tab label from pane state. None if there is nothing to go on (leave the tab alone)."""
     # A cd inside the shell shows up in foreground_cwd, so prefer it.
     cwd = pane.get("foreground_cwd") or pane.get("cwd")
     folder = folder_label(cwd, home) if cwd else None
@@ -142,9 +150,9 @@ def desired_label(
         if program in REMOTE_PROGRAMS:
             argv = command_argv(leader) if leader else []
             return _remote_label(program, argv, pane.get("terminal_title_stripped") or "", folder, local_host)
-        return _join(program, _with_branch(folder, branch))
+        return _join(program, folder or "")
 
-    return truncate_label(_with_branch(folder, branch)) if folder else None
+    return truncate_label(folder) if folder else None
 
 
 def is_managed(tab: dict, position: int, record: Optional[Collection[str]], workspace_labels: Collection[str]) -> bool:
@@ -159,7 +167,7 @@ def is_managed(tab: dict, position: int, record: Optional[Collection[str]], work
     Note: the tab's `number` field is not the default label. A tab created after closing another
     was observed with number=4 while its position-based default label was "2" (Herdr 0.9.5).
     """
-    label = tab.get("label")
+    label = strip_status(tab.get("label") or "")
     if label == str(position):
         return True
     if record is not None:
@@ -167,8 +175,20 @@ def is_managed(tab: dict, position: int, record: Optional[Collection[str]], work
     return label in workspace_labels
 
 
-# (tab_id, workspace_id, current label, desired label or None) — one per managed tab
-TabPlan = Tuple[str, str, str, Optional[str]]
+class TabPlan(NamedTuple):
+    """What to do with one tab.
+
+    Names (`*_name`) are labels without the status mark. Records hold names, not labels, so a mark that comes
+    and goes with the agent status never makes a plugin-set label look like a user-set one.
+    """
+
+    tab_id: str
+    workspace_id: str
+    current: str  # label in the tab bar now
+    desired: str  # label it should have (may equal current)
+    managed: bool  # True: the plugin owns the name. False: pinned or user-set, only the mark is updated
+    current_name: str
+    desired_name: str
 
 
 def plan_tabs(
@@ -177,18 +197,16 @@ def plan_tabs(
     process_infos: Optional[Dict[str, dict]] = None,
     home: Optional[str] = None,
     local_host: str = "",
-    branches: Optional[Dict[str, str]] = None,
 ) -> List[TabPlan]:
-    """Compute the current and desired label for every managed tab.
+    """Compute the current and desired label for every tab.
 
     Unchanged tabs are returned too: the daemon must refresh their records every time, or a long-unchanged tab
     gets pushed out of the record and freezes as a "user-set name".
+    Pinned and user-set tabs keep their name; only their status mark follows tab.agent_status.
     process_infos: focused pane ID → pane.process_info result (missing ones fall back to the folder name rule).
-    branches: focused pane ID → git branch of its folder (missing means no branch is shown).
-    Pinned tabs (pin action) are skipped entirely, even when their label is the default position number.
+    Pinned tabs (pin action) are never managed, even when their label is the default position number.
     """
     process_infos = process_infos or {}
-    branches = branches or {}
     workspaces = state.get("workspaces", {})
     # Build lookup dicts once instead of scanning linearly per tab.
     panes_by_id = {p.get("pane_id"): p for p in snapshot.get("panes", [])}
@@ -207,24 +225,31 @@ def plan_tabs(
         if not tab_id or not isinstance(label, str):
             continue
         entry = workspaces.get(workspace_id) or {}
-        if tab_id in (entry.get("pinned") or {}):
-            continue
+        status = tab.get("agent_status")
+        current_name = strip_status(label)
+        pinned = tab_id in (entry.get("pinned") or {})
         record = (entry.get("tabs") or {}).get(tab_id)
-        if not is_managed(tab, positions[workspace_id], record, entry.get("labels") or []):
+        managed = not pinned and is_managed(tab, positions[workspace_id], record, entry.get("labels") or [])
+        if not managed:
+            # Never shorten a name the user typed: the mark is just put in front of it.
+            plans.append(
+                TabPlan(tab_id, workspace_id, label, with_status(current_name, status), False, current_name, current_name)
+            )
             continue
-        # If the layout or pane does not exist yet (e.g. right after tab creation), recompute on the next event.
+        # If the layout or pane does not exist yet (e.g. right after tab creation), keep the name for now
+        # (the next event recomputes it) but still let the mark follow the status.
         pane_id = focused_by_tab.get(tab_id)
         pane = panes_by_id.get(pane_id)
-        if pane is None:
-            continue
-        desired = desired_label(
-            pane,
-            process_infos.get(pane_id or ""),
-            home=home,
-            local_host=local_host,
-            branch=branches.get(pane_id or ""),
+        computed = None
+        if pane is not None:
+            computed = desired_label(pane, process_infos.get(pane_id or ""), home=home, local_host=local_host)
+        desired_name = computed if computed is not None else current_name
+        if STATUS_MARKS.get(status or ""):
+            # Leave room for "<mark> " so the whole label stays within MAX_LABEL_WIDTH.
+            desired_name = _cut_to_width(desired_name, MAX_LABEL_WIDTH - 2)
+        plans.append(
+            TabPlan(tab_id, workspace_id, label, with_status(desired_name, status), True, current_name, desired_name)
         )
-        plans.append((tab_id, workspace_id, label, desired))
     return plans
 
 
@@ -234,11 +259,10 @@ def plan_renames(
     process_infos: Optional[Dict[str, dict]] = None,
     home: Optional[str] = None,
     local_host: str = "",
-    branches: Optional[Dict[str, str]] = None,
 ) -> List[Tuple[str, str]]:
     """The (tab_id, new_label) pairs to rename. Same-label renames are excluded since they only add events."""
     return [
-        (tab_id, desired)
-        for tab_id, _ws, current, desired in plan_tabs(snapshot, state, process_infos, home, local_host, branches)
-        if desired is not None and desired != current
+        (plan.tab_id, plan.desired)
+        for plan in plan_tabs(snapshot, state, process_infos, home, local_host)
+        if plan.desired != plan.current
     ]

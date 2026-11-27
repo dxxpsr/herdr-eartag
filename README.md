@@ -13,15 +13,27 @@ The first rule that matches wins. If a tab has several panes, the **focused pane
 | Another AI agent (codex, gemini, ...) | Title reported by the agent, otherwise `agent · folder` | `codex · herdr-eartag` |
 | Connected via `ssh`/`mosh` | `ssh · server` | `ssh · prod` |
 | └ remote shell sends a `user@host:path` title | `server · remote folder` | `prod · app` |
-| A program is running in the shell | `program · folder` (+ git branch) | `vim · herdr-eartag`, `npm · web ⎇ new-ui` |
-| Shell is idle | Current folder name (`~` for the home folder) (+ git branch) | `herdr-eartag`, `herdr-eartag ⎇ fix-login` |
+| A program is running in the shell | `program · folder` | `vim · herdr-eartag`, `npm · web` |
+| Shell is idle | Current folder name (`~` for the home folder) | `herdr-eartag`, `~` |
 | No information available | Current name is kept | — |
 
+- **AI agent status** is shown as one mark in front of the name, on every tab with an agent (pinned and hand-named tabs too).
+  Herdr shows agent status only in its sidebar, so this is what tells agent tabs apart in the tab bar.
+
+  The marks are the ones Herdr's sidebar uses with `status_indicators = "symbols"`:
+
+  | Mark | Status | Example |
+  |---|---|---|
+  | `◐` | working | `◐ Herdr eartag` |
+  | `×` | waiting for you (approval, question) | `× Herdr eartag` |
+  | `✓` | finished, not looked at yet | `✓ Herdr eartag` |
+  | `○` | idle | `○ Herdr eartag` |
+  | — | no agent in the tab | `herdr-eartag` |
+
+  The mark is never counted as part of the name: changing it does not make the plugin think you renamed the tab,
+  and a hand-named tab only gets the mark added or removed, never shortened.
 - Names wider than 30 columns (CJK characters count as 2) are truncated with `…`.
 - The **program name** is the leading process of the command the shell ran. `npm run dev` shows as `npm`, `python3 app.py` as `app.py`.
-- The **git branch** is added as `folder ⎇ branch` when the folder is inside a git repository (worktrees included).
-  It is left out on `main`/`master`, cut to 12 columns, and never added to agent or ssh labels.
-  A detached HEAD shows the short commit hash. It is read straight from `.git/HEAD` (no `git` process).
 - The **ssh server name** comes from the command you typed. With an `~/.ssh/config` alias (`ssh prod`), the alias is shown.
   The remote folder is shown only if the remote shell sets the terminal title (e.g. default bash on Ubuntu). Otherwise the name stays `ssh · server`.
 - No external dependencies: only the standard library of the system `python3` (3.9+).

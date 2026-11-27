@@ -14,6 +14,8 @@ from eartag.naming import (
     needs_process_info,
     plan_renames,
     plan_tabs,
+    strip_status,
+    with_status,
     truncate_label,
 )
 
@@ -117,35 +119,6 @@ class ActivityLabelTest(unittest.TestCase):
     def test_needs_process_info(self) -> None:
         self.assertTrue(needs_process_info({"agent": None}))
         self.assertFalse(needs_process_info({"agent": "claude"}))
-
-
-class BranchLabelTest(unittest.TestCase):
-    """The git branch is appended to the folder part of shell and program labels."""
-
-    BASE = {"agent": None, "terminal_title_stripped": "", "foreground_cwd": "/w/proj"}
-
-    def test_idle_shell_with_branch(self) -> None:
-        self.assertEqual(desired_label(self.BASE, _proc_info(ZSH), branch="fix-login"), "proj ⎇ fix-login")
-
-    def test_program_with_branch(self) -> None:
-        self.assertEqual(desired_label(self.BASE, _proc_info(VIM), branch="fix-login"), "vim · proj ⎇ fix-login")
-
-    def test_default_branches_are_omitted(self) -> None:
-        # main/master is the usual state, so showing it only costs width.
-        self.assertEqual(desired_label(self.BASE, _proc_info(ZSH), branch="main"), "proj")
-        self.assertEqual(desired_label(self.BASE, _proc_info(ZSH), branch="master"), "proj")
-
-    def test_long_branch_is_cut_to_its_own_budget(self) -> None:
-        self.assertEqual(
-            desired_label(self.BASE, _proc_info(ZSH), branch="feature/login-redesign"), "proj ⎇ feature/log…"
-        )
-
-    def test_branch_not_added_to_agent_or_remote_labels(self) -> None:
-        claude = {**self.BASE, "agent": "claude", "terminal_title_stripped": "Herdr eartag"}
-        self.assertEqual(desired_label(claude, branch="fix-login"), "Herdr eartag")
-        self.assertEqual(desired_label({**self.BASE, "agent": "codex"}, branch="fix-login"), "codex · proj")
-        ssh = _proc_info({"pid": 1, "name": "ssh", "argv0": "ssh", "argv": ["ssh", "prod"]})
-        self.assertEqual(desired_label(self.BASE, ssh, local_host="mac", branch="fix-login"), "ssh · prod")
 
 
 def _state(ws_labels: Optional[dict] = None, tabs: Optional[dict] = None) -> dict:
@@ -263,22 +236,95 @@ class PlanRenamesTest(unittest.TestCase):
         self.assertEqual(plan_renames(snapshot, _state()), [])
 
 
-    def test_plan_renames_uses_branches(self) -> None:
-        snapshot = {
-            "tabs": [{"tab_id": "w1:t1", "label": "1", "number": 1, "workspace_id": "w1"}],
-            "layouts": [{"tab_id": "w1:t1", "focused_pane_id": "p1"}],
-            "panes": [{"pane_id": "p1", "agent": None, "terminal_title_stripped": "", "foreground_cwd": "/w/proj"}],
-        }
-        self.assertEqual(
-            plan_renames(snapshot, _state(), {"p1": _proc_info(ZSH)}, branches={"p1": "dev"}), [("w1:t1", "proj ⎇ dev")]
-        )
-
-    def test_pinned_tab_is_never_planned(self) -> None:
+    def test_pinned_tab_is_never_renamed(self) -> None:
         # Even the default position label is left alone once the tab is pinned.
         snapshot = _snapshot()
         state = _state({"w1": ["proj"]})
         state["workspaces"]["w1"]["pinned"] = {"w1:t1": "1", "w1:t3": "proj"}
-        self.assertEqual(plan_tabs(snapshot, state), [])
+        self.assertEqual(plan_renames(snapshot, state), [])
+        self.assertFalse(any(plan.managed for plan in plan_tabs(snapshot, state)))
+
+
+class StatusMarkTest(unittest.TestCase):
+    """One-cell agent status mark in front of the tab name."""
+
+    def test_with_status_uses_herdr_symbols(self) -> None:
+        # Same glyphs as Herdr's sidebar with status_indicators = "symbols".
+        self.assertEqual(with_status("proj", "working"), "◐ proj")
+        self.assertEqual(with_status("proj", "blocked"), "× proj")
+        self.assertEqual(with_status("proj", "done"), "✓ proj")
+        self.assertEqual(with_status("proj", "idle"), "○ proj")
+        self.assertEqual(with_status("proj", "unknown"), "proj")
+        self.assertEqual(with_status("proj", None), "proj")
+
+    def test_strip_status(self) -> None:
+        self.assertEqual(strip_status("◐ proj"), "proj")
+        self.assertEqual(strip_status("× 배포 작업"), "배포 작업")
+        self.assertEqual(strip_status("proj"), "proj")
+        self.assertEqual(strip_status("◐proj"), "◐proj")  # no space → part of the name
+        self.assertEqual(strip_status("○ ◐ proj"), "◐ proj")  # only one mark is ours
+
+    def test_strip_status_accepts_previous_marks(self) -> None:
+        # Tabs still carry the marks of v0.5.0 (✻ ! ✳); they must not be mistaken for part of the name.
+        self.assertEqual(strip_status("✻ proj"), "proj")
+        self.assertEqual(strip_status("! proj"), "proj")
+        self.assertEqual(strip_status("✳ proj"), "proj")
+
+    def test_previous_mark_is_replaced_not_stacked(self) -> None:
+        state = _state(tabs={"w1": {"w1:t1": ["Herdr eartag"]}})
+        self.assertEqual(plan_renames(_status_snapshot("✻ Herdr eartag", "working"), state), [("w1:t1", "◐ Herdr eartag")])
+
+
+def _status_snapshot(label: str, status: Optional[str], title: str = "Herdr eartag") -> dict:
+    return {
+        "tabs": [{"tab_id": "w1:t1", "label": label, "number": 1, "workspace_id": "w1", "agent_status": status}],
+        "layouts": [{"tab_id": "w1:t1", "focused_pane_id": "p1"}],
+        "panes": [{"pane_id": "p1", "agent": "claude", "terminal_title_stripped": title, "foreground_cwd": "/w/proj"}],
+    }
+
+
+class StatusPlanTest(unittest.TestCase):
+    def test_managed_tab_gets_status_mark(self) -> None:
+        self.assertEqual(plan_renames(_status_snapshot("1", "working"), _state()), [("w1:t1", "◐ Herdr eartag")])
+
+    def test_marked_label_still_counts_as_plugin_set(self) -> None:
+        state = _state(tabs={"w1": {"w1:t1": ["Herdr eartag"]}})
+        self.assertEqual(plan_renames(_status_snapshot("◐ Herdr eartag", "idle"), state), [("w1:t1", "○ Herdr eartag")])
+        plan = plan_tabs(_status_snapshot("◐ Herdr eartag", "idle"), state)[0]
+        self.assertTrue(plan.managed)
+        self.assertEqual((plan.current_name, plan.desired_name), ("Herdr eartag", "Herdr eartag"))
+
+    def test_manual_tab_gets_mark_but_stays_manual(self) -> None:
+        state = _state(tabs={"w1": {"w1:t1": ["proj"]}})
+        self.assertEqual(plan_renames(_status_snapshot("배포 작업", "working"), state), [("w1:t1", "◐ 배포 작업")])
+        self.assertEqual(plan_renames(_status_snapshot("◐ 배포 작업", "blocked"), state), [("w1:t1", "× 배포 작업")])
+        self.assertEqual(plan_renames(_status_snapshot("◐ 배포 작업", "unknown"), state), [("w1:t1", "배포 작업")])
+        self.assertFalse(plan_tabs(_status_snapshot("◐ 배포 작업", "working"), state)[0].managed)
+
+    def test_pinned_tab_gets_mark(self) -> None:
+        state = _state()
+        state["workspaces"]["w1"] = {"labels": [], "tabs": {}, "pinned": {"w1:t1": "deploy"}}
+        self.assertEqual(plan_renames(_status_snapshot("deploy", "done"), state), [("w1:t1", "✓ deploy")])
+
+    def test_long_plugin_label_fits_with_mark(self) -> None:
+        title = "가" * 20  # 40 cells
+        ((_, label),) = plan_renames(_status_snapshot("1", "working", title), _state())
+        # Wide characters cannot always fill the last cell, so the bound is "at most".
+        self.assertLessEqual(display_width(label), MAX_LABEL_WIDTH)
+        self.assertGreaterEqual(display_width(label), MAX_LABEL_WIDTH - 1)
+        self.assertTrue(label.startswith("◐ ") and label.endswith("…"))
+
+    def test_long_manual_name_is_not_cut(self) -> None:
+        # The plugin never shortens a name the user typed; the mark is simply added in front.
+        name = "a" * MAX_LABEL_WIDTH
+        state = _state(tabs={"w1": {"w1:t1": ["proj"]}})
+        self.assertEqual(plan_renames(_status_snapshot(name, "working"), state), [("w1:t1", "◐ " + name)])
+
+    def test_managed_tab_without_pane_still_updates_mark(self) -> None:
+        snapshot = _status_snapshot("◐ Herdr eartag", "idle")
+        snapshot["layouts"], snapshot["panes"] = [], []
+        state = _state(tabs={"w1": {"w1:t1": ["Herdr eartag"]}})
+        self.assertEqual(plan_renames(snapshot, state), [("w1:t1", "○ Herdr eartag")])
 
 
 if __name__ == "__main__":
