@@ -41,7 +41,7 @@ The first rule that matches wins. If a tab has several panes, the **focused pane
 ## Install / uninstall
 
 ```bash
-herdr plugin link ~/projects/herdr-eartag           # link (path to the plugin folder)
+herdr plugin link .                                 # link this plugin folder
 herdr plugin action invoke herdr-eartag.start       # start the daemon now (afterwards it starts with Herdr)
 
 herdr plugin action invoke herdr-eartag.stop        # stop the daemon before unlinking
